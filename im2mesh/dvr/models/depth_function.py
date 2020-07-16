@@ -66,7 +66,7 @@ class DepthModule(nn.Module):
                 res = res * 2
             return [res, res + 1]
 
-    def forward(self, ray0, ray_direction, decoder, c=None, it=None,
+    def forward(self, ray0, ray_direction, decoder, model, it=None,
                 n_steps=None):
         ''' Calls the depth function and returns predicted depth values.
 
@@ -82,7 +82,6 @@ class DepthModule(nn.Module):
             ray0 (tensor): ray starting points (camera center)
             ray_direction (tensor): direction of ray
             decoder (nn.Module): decoder model to evaluate points on the ray
-            c (tensor): latent conditioned code c
             it (int): training iteration (used for ray sampling scheduler)
             n_steps (tuple): number of evaluation steps; this overwrites
                 self.n_steps if not None.
@@ -95,14 +94,14 @@ class DepthModule(nn.Module):
             else:
                 n_steps = self.n_steps
         if n_steps[1] > 1:
-            inputs = [ray0, ray_direction, decoder, c, n_steps,
+            inputs = [ray0, ray_direction, decoder, model, n_steps,
                       self.n_secant_steps, self.tau, self.depth_range,
                       self.method, self.check_cube_intersection,
-                      self.max_points] + [k for k in decoder.parameters()]
-            d_hat = self.calc_depth(*inputs)
+                      self.max_points] + [k for k in model.occupancy_parameters]
+            d_hat, p = self.calc_depth(*inputs)
         else:
-            d_hat = torch.full((batch_size, n_p), np.inf).to(device)
-        return d_hat
+            d_hat, p = torch.full((batch_size, n_p), np.inf).to(device)
+        return d_hat, p
 
 
 class DepthFunction(torch.autograd.Function):
@@ -141,7 +140,7 @@ class DepthFunction(torch.autograd.Function):
 
     @staticmethod
     def run_Secant_method(f_low, f_high, d_low, d_high, n_secant_steps,
-                          ray0_masked, ray_direction_masked, decoder, c,
+                          ray0_masked, ray_direction_masked, decoder,
                           logit_tau):
         ''' Runs the secant method for interval [d_low, d_high].
 
@@ -152,15 +151,14 @@ class DepthFunction(torch.autograd.Function):
             ray0_masked (tensor): masked ray start points
             ray_direction_masked (tensor): masked ray direction vectors
             decoder (nn.Module): decoder model to evaluate point occupancies
-            c (tensor): latent conditioned code c
             logit_tau (float): threshold value in logits
         '''
         d_pred = - f_low * (d_high - d_low) / (f_high - f_low) + d_low
         for i in range(n_secant_steps):
             p_mid = ray0_masked + d_pred.unsqueeze(-1) * ray_direction_masked
             with torch.no_grad():
-                f_mid = decoder(p_mid, c, batchwise=False,
-                                only_occupancy=True) - logit_tau
+                f_mid = decoder(p_mid.unsqueeze(0)) - logit_tau
+                f_mid = f_mid.squeeze()
             ind_low = f_mid < 0
             if ind_low.sum() > 0:
                 d_low[ind_low] = d_pred[ind_low]
@@ -173,7 +171,7 @@ class DepthFunction(torch.autograd.Function):
         return d_pred
 
     @staticmethod
-    def perform_ray_marching(ray0, ray_direction, decoder, c=None,
+    def perform_ray_marching(ray0, ray_direction, decoder,
                              tau=0.5, n_steps=[128, 129], n_secant_steps=8,
                              depth_range=[0., 2.4], method='secant',
                              check_cube_intersection=True, max_points=3500000):
@@ -188,7 +186,6 @@ class DepthFunction(torch.autograd.Function):
             ray0 (tensor): ray start points of dimension B x N x 3
             ray_direction (tensor):ray direction vectors of dim B x N x 3
             decoder (nn.Module): decoder model to evaluate point occupancies
-            c (tensor): latent conditioned code
             tay (float): threshold value
             n_steps (tuple): interval from which the number of evaluation
                 steps if sampled
@@ -227,7 +224,7 @@ class DepthFunction(torch.autograd.Function):
         # Evaluate all proposal points in parallel
         with torch.no_grad():
             val = torch.cat([(
-                decoder(p_split, c, only_occupancy=True) - logit_tau)
+                decoder(p_split) - logit_tau)
                 for p_split in torch.split(
                     p_proposal.view(batch_size, -1, 3),
                     int(max_points / batch_size), dim=1)], dim=1).view(
@@ -274,18 +271,18 @@ class DepthFunction(torch.autograd.Function):
         ray_direction_masked = ray_direction[mask]
 
         # write c in pointwise format
-        if c is not None and c.shape[-1] != 0:
-            c = c.unsqueeze(1).repeat(1, n_pts, 1)[mask]
+        # if c is not None and c.shape[-1] != 0:
+        #     c = c.unsqueeze(1).repeat(1, n_pts, 1)[mask]
 
         # Apply surface depth refinement step (e.g. Secant method)
         if method == 'secant' and mask.sum() > 0:
             d_pred = DepthFunction.run_Secant_method(
                 f_low, f_high, d_low, d_high, n_secant_steps, ray0_masked,
-                ray_direction_masked, decoder, c, logit_tau)
+                ray_direction_masked, decoder, logit_tau)
         elif method == 'bisection' and mask.sum() > 0:
             d_pred = DepthFunction.run_Bisection_method(
                 d_low, d_high, n_secant_steps, ray0_masked,
-                ray_direction_masked, decoder, c, logit_tau)
+                ray_direction_masked, decoder, logit_tau)
         else:
             d_pred = torch.ones(ray_direction_masked.shape[0]).to(device)
 
@@ -297,7 +294,7 @@ class DepthFunction(torch.autograd.Function):
         d_pred_out = torch.ones(batch_size, n_pts).to(device)
         d_pred_out[mask] = d_pred
 
-        return d_pred_out, pt_pred, mask, mask_0_not_occupied
+        return d_pred_out, pt_pred, mask, mask_0_not_occupied, p_proposal
 
     @staticmethod
     def forward(ctx, *input):
@@ -306,14 +303,14 @@ class DepthFunction(torch.autograd.Function):
         Args:
             input (list): input to forward function
         '''
-        (ray0, ray_direction, decoder, c, n_steps, n_secant_steps, tau,
+        (ray0, ray_direction, decoder, model, n_steps, n_secant_steps, tau,
          depth_range, method, check_cube_intersection, max_points) = input[:11]
 
         # Get depth values
         with torch.no_grad():
-            d_pred, p_pred, mask, mask_0_not_occupied = \
+            d_pred, p_pred, mask, mask_0_not_occupied, p_proposal = \
                 DepthFunction.perform_ray_marching(
-                    ray0, ray_direction, decoder, c, tau, n_steps,
+                    ray0, ray_direction, decoder, tau, n_steps,
                     n_secant_steps, depth_range, method, check_cube_intersection,
                     max_points)
 
@@ -322,14 +319,15 @@ class DepthFunction(torch.autograd.Function):
         d_pred[mask_0_not_occupied == 0] = 0
 
         # Save values for backward pass
-        ctx.save_for_backward(ray0, ray_direction, d_pred, p_pred, c)
+        ctx.save_for_backward(ray0, ray_direction, d_pred, p_pred)
         ctx.decoder = decoder
+        ctx.model = model
         ctx.mask = mask
 
-        return d_pred
+        return d_pred, p_proposal
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, grad_variables):
         ''' Performs the backward pass of the Depth function.
 
         We use the analytic formula derived in the main publication for the
@@ -340,18 +338,19 @@ class DepthFunction(torch.autograd.Function):
 
         Args:
             ctx (Pytorch Autograd Context): pytorch autograd context
-            grad_output (tensor): gradient outputs
+            grad_output (tensor): gradient of loss wrt depth
         '''
-        ray0, ray_direction, d_pred, p_pred, c = ctx.saved_tensors
+        ray0, ray_direction, d_pred, p_pred = ctx.saved_tensors
         decoder = ctx.decoder
+        model = ctx.model
         mask = ctx.mask
         eps = 1e-3
 
         with torch.enable_grad():
             p_pred.requires_grad = True
-            f_p = decoder(p_pred, c, only_occupancy=True)
+            f_p = decoder(p_pred).squeeze(-1)
             f_p_sum = f_p.sum()
-            grad_p = torch.autograd.grad(f_p_sum, p_pred, retain_graph=True)[0]
+            grad_p = torch.autograd.grad(f_p_sum, p_pred, retain_graph=True, allow_unused=True)[0]
             grad_p_dot_v = (grad_p * ray_direction).sum(-1)
 
             if mask.sum() > 0:
@@ -363,23 +362,22 @@ class DepthFunction(torch.autograd.Function):
                 grad_outputs = grad_outputs * mask.float()
 
             # Gradients for latent code c
-            if c is None or c.shape[-1] == 0 or mask.sum() == 0:
-                gradc = None
-            else:
-                gradc = torch.autograd.grad(f_p, c, retain_graph=True,
-                                            grad_outputs=grad_outputs)[0]
+            # if c is None or c.shape[-1] == 0 or mask.sum() == 0:
+            #     gradc = None
+            # else:
+            #     gradc = torch.autograd.grad(f_p, c, retain_graph=True,
+            #                                 grad_outputs=grad_outputs)[0]
 
             # Gradients for network parameters phi
             if mask.sum() > 0:
                 # Accumulates gradients weighted by grad_outputs variable
                 grad_phi = torch.autograd.grad(
-                    f_p, [k for k in decoder.parameters()],
-                    grad_outputs=grad_outputs, retain_graph=True)
+                    f_p, [k for k in model.occupancy_parameters],
+                    grad_outputs=grad_outputs, retain_graph=True, allow_unused=True)
             else:
-                grad_phi = [None for i in decoder.parameters()]
+                grad_phi = [None for i in model.occupancy_parameters]
 
         # Return gradients for c, z, and network parameters and None
         # for all other inputs
-        out = [None, None, None, gradc, None, None, None, None, None,
-               None, None] + list(grad_phi)
+        out = [None for _ in range(11)] + list(grad_phi)
         return tuple(out)
