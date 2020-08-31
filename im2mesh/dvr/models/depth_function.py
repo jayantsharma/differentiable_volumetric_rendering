@@ -168,6 +168,7 @@ class DepthFunction(torch.autograd.Function):
                 f_high[ind_low == 0] = f_mid[ind_low == 0]
 
             d_pred = - f_low * (d_high - d_low) / (f_high - f_low) + d_low
+
         return d_pred
 
     @staticmethod
@@ -315,8 +316,8 @@ class DepthFunction(torch.autograd.Function):
                     max_points)
 
         # Insert appropriate values for points where no depth is predicted
-        d_pred[mask == 0] = np.inf
-        d_pred[mask_0_not_occupied == 0] = 0
+        d_pred[mask == 0] = depth_range[1]
+        d_pred[mask_0_not_occupied == 0] = depth_range[0]
 
         # Save values for backward pass
         ctx.save_for_backward(ray0, ray_direction, d_pred, p_pred)

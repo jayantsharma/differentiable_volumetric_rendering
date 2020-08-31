@@ -412,8 +412,7 @@ class Trainer(BaseTrainer):
         self.calc_photoconsistency_loss(mask_rgb, rgb_pred,
                                         img, p, reduction_method, loss,
                                         patch_size, eval_mode)
-
-        # 4.2) Calculate Depth Loss
+# 4.2) Calculate Depth Loss
         mask_depth = mask_pred & mask_gt
         self.calc_depth_loss(mask_depth, depth_img, p, camera_mat,
                              world_mat, scale_mat, p_world_hat,
